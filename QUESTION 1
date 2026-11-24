@@ -1,6 +1,7 @@
--- ICT371 | Question 1: Pharmacy Stock and Daily Sales
--- Compiled by MULAKO MUYOBA JR. | Student number: 202407184
--- PostgreSQL
+QUESTION 1: Pharmacy Stock and Daily Sales
+NAME:Memory Mutemwa
+STUDENT NUMBER: 202404528
+PostgreSQL
 
 CREATE TABLE medicines (
   medicine_id SERIAL PRIMARY KEY,

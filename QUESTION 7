@@ -1,0 +1,101 @@
+CREATE TABLE customers (
+  customer_id SERIAL PRIMARY KEY,
+  full_name VARCHAR(100) NOT NULL
+);
+CREATE TABLE readings (
+  reading_id SERIAL PRIMARY KEY,
+  customer_id INTEGER NOT NULL REFERENCES customers(customer_id),
+  reading_month DATE NOT NULL CHECK (reading_month = DATE_TRUNC('month', reading_month)::DATE),
+  previous_reading NUMERIC(12,2) NOT NULL CHECK (previous_reading >= 0),
+  current_reading NUMERIC(12,2) NOT NULL CHECK (current_reading >= 0),
+  UNIQUE (customer_id, reading_month)
+);
+CREATE TABLE bills (
+  bill_id SERIAL PRIMARY KEY,
+  reading_id INTEGER NOT NULL UNIQUE REFERENCES readings(reading_id),
+  charge NUMERIC(12,2) NOT NULL CHECK (charge >= 0),
+  amount_paid NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (amount_paid >= 0 AND amount_paid <= charge),
+  due_on DATE NOT NULL
+);
+CREATE TABLE receivable_snapshot (
+  snapshot_date DATE PRIMARY KEY,
+  total_due NUMERIC(14,2) NOT NULL
+);
+
+INSERT INTO customers(full_name) VALUES ('Grace'), ('Isaac'), ('Lillian');
+
+CREATE OR REPLACE FUNCTION fn_water_charge(p_units NUMERIC)
+RETURNS NUMERIC(12,2) LANGUAGE plpgsql AS $$
+BEGIN
+  IF p_units IS NULL OR p_units < 0 THEN RAISE EXCEPTION 'Consumption must be non-negative'; END IF;
+  RETURN (LEAST(p_units, 10) * 5 + GREATEST(p_units - 10, 0) * 8)::NUMERIC(12,2);
+END; $$;
+
+CREATE OR REPLACE PROCEDURE pr_generate_bill(p_reading_id INTEGER, p_due_on DATE)
+LANGUAGE plpgsql AS $$
+DECLARE v_previous NUMERIC(12,2); v_current NUMERIC(12,2);
+BEGIN
+  IF p_due_on IS NULL THEN RAISE EXCEPTION 'Bill due date is required'; END IF;
+  SELECT previous_reading, current_reading
+  INTO v_previous, v_current FROM readings WHERE reading_id = p_reading_id;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Unknown reading'; END IF;
+  IF EXISTS (SELECT 1 FROM bills WHERE reading_id = p_reading_id) THEN
+    RAISE EXCEPTION 'A bill already exists for this reading';
+  END IF;
+  INSERT INTO bills(reading_id, charge, amount_paid, due_on)
+  VALUES (p_reading_id, fn_water_charge(v_current - v_previous), 0, p_due_on);
+END; $$;
+
+CREATE OR REPLACE FUNCTION fn_validate_reading()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.current_reading < NEW.previous_reading THEN
+    RAISE EXCEPTION 'Current reading cannot be below previous reading';
+  END IF;
+  RETURN NEW;
+END; $$;
+CREATE TRIGGER trg_validate_reading
+BEFORE INSERT OR UPDATE ON readings
+FOR EACH ROW EXECUTE FUNCTION fn_validate_reading();
+
+INSERT INTO readings(customer_id, reading_month, previous_reading, current_reading) VALUES
+(1, DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')::DATE, 0, 0),
+(1, DATE_TRUNC('month', CURRENT_DATE)::DATE, 0, 10),
+(2, DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')::DATE, 20, 35),
+(2, DATE_TRUNC('month', CURRENT_DATE)::DATE, 35, 50),
+(3, DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')::DATE, 5, 15),
+(3, DATE_TRUNC('month', CURRENT_DATE)::DATE, 15, 32);
+
+-- Generate a bill for each sample reading.
+DO $$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN SELECT reading_id FROM readings LOOP
+    CALL pr_generate_bill(r.reading_id, CURRENT_DATE + 14);
+  END LOOP;
+END; $$;
+
+CREATE OR REPLACE VIEW v_overdue_bills AS
+SELECT c.full_name, b.due_on, b.charge - b.amount_paid AS outstanding_amount
+FROM bills b JOIN readings r ON r.reading_id = b.reading_id
+JOIN customers c ON c.customer_id = r.customer_id
+WHERE b.due_on < CURRENT_DATE AND b.amount_paid < b.charge;
+SELECT * FROM v_overdue_bills;
+
+CREATE INDEX idx_bills_due_unpaid ON bills(due_on) WHERE amount_paid < charge;
+EXPLAIN SELECT * FROM bills
+WHERE due_on < CURRENT_DATE AND amount_paid < charge;
+
+CREATE OR REPLACE PROCEDURE pr_refresh_receivables()
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO receivable_snapshot(snapshot_date, total_due)
+  SELECT CURRENT_DATE, COALESCE(SUM(charge - amount_paid), 0)
+  FROM bills WHERE amount_paid < charge
+  ON CONFLICT (snapshot_date) DO UPDATE
+  SET total_due = EXCLUDED.total_due;
+END; $$;
+
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+SELECT cron.schedule('daily-receivables', '30 0 * * *',
+                     'CALL pr_refresh_receivables()');
